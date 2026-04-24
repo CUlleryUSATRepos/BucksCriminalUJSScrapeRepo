@@ -1,6 +1,7 @@
 import datetime as dt
 from urllib.parse import urljoin
-
+from pathlib import Path
+import shutil
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
@@ -201,6 +202,9 @@ def run_scrape(county, filed_start, filed_end, criminal_only=True, save_csv=True
         else:
             combined_df = result_df.copy()
         combined_df.to_csv(output_file, index=False)
+        docs_data_dir = Path("docs") / "data"
+        docs_data_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(output_file, docs_data_dir / output_file)
         new_rows = len(result_df)
         total_rows = len(combined_df)
         print(f"Processed {new_rows} scraped rows")
