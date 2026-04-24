@@ -170,11 +170,42 @@ def run_scrape(county, filed_start, filed_end, criminal_only=True, save_csv=True
         result_df = df.copy()
 
     if save_csv:
+        import os
+
         county_slug = county.lower().replace(" ", "_")
         suffix = "criminal" if criminal_only else "all"
-        output_file = f"ujs_{suffix}_{county_slug}_{filed_start}_to_{filed_end}.csv"
-        result_df.to_csv(output_file, index=False)
-        print(f"Saved {len(result_df)} rows to {output_file}")
+        output_file = f"ujs_{suffix}_{county_slug}.csv"
+
+        dedupe_columns = [
+            "DocketNumber",
+            "ComplaintNumber",
+            "IncidentNumber",
+            "EventDate",
+            "EventType"
+        ]
+        result_df = result_df.copy()
+
+        for col in dedupe_columns:
+            if col not in result_df.columns:
+                result_df[col] = ""
+            result_df[col] = result_df[col].fillna("").astype(str).str.strip()
+
+        if os.path.exists(output_file):
+            existing_df = pd.read_csv(output_file, dtype=str, keep_default_na=False).fillna("")
+            for col in dedupe_columns:
+                if col not in existing_df.columns:
+                    existing_df[col] = ""
+                existing_df[col] = existing_df[col].fillna("").astype(str).str.strip()
+            combined_df = pd.concat([existing_df, result_df], ignore_index=True)
+            combined_df = combined_df.drop_duplicates(subset=dedupe_columns, keep="first")
+        else:
+            combined_df = result_df.copy()
+        combined_df.to_csv(output_file, index=False)
+        new_rows = len(result_df)
+        total_rows = len(combined_df)
+        print(f"Processed {new_rows} scraped rows")
+        print(f"Saved deduped master file: {output_file}")
+        print(f"Master File now has {total_rows} rows")
 
     return result_df
 
