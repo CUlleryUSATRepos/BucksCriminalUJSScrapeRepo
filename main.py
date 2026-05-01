@@ -85,6 +85,53 @@ def fetch_search_results(session, payload):
     resp.raise_for_status()
     return resp.text
 
+from pathlib import Path
+
+def load_email_credentials(path="crimewatch_scraper_pwd.txt"):
+    cred_path = Path(path)
+
+    if not cred_path.exists():
+        raise FileNotFoundError(
+            f"Missing email credentials file: {cred_path}. "
+            "Expected two lines: sender email and Gmail app password."
+        )
+
+    lines = [line.strip() for line in cred_path.read_text(encoding="utf-8").splitlines()]
+
+    if len(lines) < 2:
+        raise ValueError(
+            f"{cred_path} must contain two lines: sender email and Gmail app password."
+        )
+
+    sender_email = lines[0]
+    sender_password = lines[1]
+
+    if not sender_email or not sender_password:
+        raise ValueError("Email credentials file has a blank email or password line.")
+
+    return sender_email, sender_password
+
+
+def load_email_recipients(path="ujs_alert_recipients.txt"):
+    recipient_path = Path(path)
+
+    if not recipient_path.exists():
+        raise FileNotFoundError(
+            f"Missing recipient file: {recipient_path}. "
+            "Expected one recipient email per line."
+        )
+
+    recipients = [
+        line.strip()
+        for line in recipient_path.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+
+    if not recipients:
+        raise ValueError(f"{recipient_path} does not contain any recipient emails.")
+
+    return recipients
+
 
 def parse_results_table(html):
     soup = BeautifulSoup(html, "html.parser")

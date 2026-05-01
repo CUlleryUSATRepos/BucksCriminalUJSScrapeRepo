@@ -4,3 +4,4 @@ __pycache__/
 .idea/
 scheduler_log.txt
 crimewatch_scraper_pwd.txt
+ujs_alert_recipients.txt
