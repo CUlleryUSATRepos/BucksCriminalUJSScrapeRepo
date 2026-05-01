@@ -1,7 +1,10 @@
 import datetime as dt
-from urllib.parse import urljoin
+from email.message import EmailMessage
 from pathlib import Path
 import shutil
+import smtplib
+from urllib.parse import urljoin
+
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
@@ -14,6 +17,22 @@ USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/147.0.0.0 Safari/537.36"
 )
+
+COUNTY = "Bucks"
+EMAIL_CREDENTIALS_FILE = "crimewatch_scraper_pwd.txt"
+EMAIL_RECIPIENTS_FILE = "ujs_alert_recipients.txt"
+SMTP_SERVER = "smtp.gmail.com"
+SMTP_PORT = 587
+
+# For today, keep this on so you can get the baseline email.
+# Later, switch this to "new_only" so it emails only when a newly scraped
+# inactive criminal complaint is added to the deduped master CSV.
+ALERT_MODE = "baseline"  # options: "baseline" or "new_only"
+
+# This keeps the alert focused on inactive criminal complaint rows, not every
+# inactive criminal docket row. Set to False if UJS does not reliably put
+# "complaint" in EventType for the rows Jo cares about.
+REQUIRE_COMPLAINT_EVENT_TYPE = True
 
 
 def get_session_and_token():
@@ -85,40 +104,42 @@ def fetch_search_results(session, payload):
     resp.raise_for_status()
     return resp.text
 
-from pathlib import Path
 
-def load_email_credentials(path="crimewatch_scraper_pwd.txt"):
+def load_email_credentials(path=EMAIL_CREDENTIALS_FILE):
     cred_path = Path(path)
 
     if not cred_path.exists():
-        raise FileNotFoundError(
-            f"Missing email credentials file: {cred_path}. "
-            "Expected two lines: sender email and Gmail app password."
-        )
+        raise FileNotFoundError(f"Missing email credentials file: {cred_path}")
 
-    lines = [line.strip() for line in cred_path.read_text(encoding="utf-8").splitlines()]
+    lines = [
+        line.strip()
+        for line in cred_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
 
-    if len(lines) < 2:
-        raise ValueError(
-            f"{cred_path} must contain two lines: sender email and Gmail app password."
-        )
+    values = {}
+    for line in lines:
+        if ":" in line:
+            key, value = line.split(":", 1)
+            values[key.strip().lower()] = value.strip()
 
-    sender_email = lines[0]
-    sender_password = lines[1]
+    sender_email = values.get("email")
+    sender_password = values.get("password")
 
     if not sender_email or not sender_password:
-        raise ValueError("Email credentials file has a blank email or password line.")
+        raise ValueError(
+            f"{cred_path} must contain lines like 'Email: ...' and 'Password: ...'"
+        )
 
     return sender_email, sender_password
 
 
-def load_email_recipients(path="ujs_alert_recipients.txt"):
+def load_email_recipients(path=EMAIL_RECIPIENTS_FILE):
     recipient_path = Path(path)
 
     if not recipient_path.exists():
         raise FileNotFoundError(
-            f"Missing recipient file: {recipient_path}. "
-            "Expected one recipient email per line."
+            f"Missing recipient file: {recipient_path}. Expected one recipient email per line."
         )
 
     recipients = [
@@ -131,6 +152,23 @@ def load_email_recipients(path="ujs_alert_recipients.txt"):
         raise ValueError(f"{recipient_path} does not contain any recipient emails.")
 
     return recipients
+
+
+def send_email_alert(subject, body, recipients):
+    sender_email, sender_password = load_email_credentials()
+
+    msg = EmailMessage()
+    msg["From"] = sender_email
+    msg["To"] = ", ".join(recipients)
+    msg["Subject"] = subject
+    msg.set_content(body)
+
+    with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+        server.starttls()
+        server.login(sender_email, sender_password)
+        server.send_message(msg)
+
+    print(f"Sent email alert to: {', '.join(recipients)}")
 
 
 def parse_results_table(html):
@@ -197,7 +235,54 @@ def parse_results_table(html):
 
 
 def filter_criminal(df):
-    return df[df["DocketNumber"].str.contains(r"-CR-", na=False)].copy()
+    if "DocketNumber" not in df.columns:
+        return df.iloc[0:0].copy()
+    return df[df["DocketNumber"].astype(str).str.contains(r"-CR-", na=False)].copy()
+
+
+def filter_inactive_criminal_complaints(df):
+    if df.empty:
+        return df.copy()
+
+    filtered = filter_criminal(df)
+
+    if "CaseStatus" in filtered.columns:
+        filtered = filtered[
+            filtered["CaseStatus"].fillna("").astype(str).str.strip().str.casefold() == "inactive"
+        ].copy()
+    else:
+        filtered = filtered.iloc[0:0].copy()
+
+    if REQUIRE_COMPLAINT_EVENT_TYPE:
+        if "EventType" in filtered.columns:
+            filtered = filtered[
+                filtered["EventType"].fillna("").astype(str).str.contains("complaint", case=False, na=False)
+            ].copy()
+        else:
+            filtered = filtered.iloc[0:0].copy()
+
+    return filtered
+
+
+def get_master_csv_path(county, criminal_only=True):
+    county_slug = county.lower().replace(" ", "_")
+    suffix = "criminal" if criminal_only else "all"
+    return Path(f"ujs_{suffix}_{county_slug}.csv")
+
+
+def prepare_dedupe_columns(df, dedupe_columns):
+    df = df.copy()
+    for col in dedupe_columns:
+        if col not in df.columns:
+            df[col] = ""
+        df[col] = df[col].fillna("").astype(str).str.strip()
+    return df
+
+
+def make_row_key(df, key_columns):
+    if df.empty:
+        return pd.Series(dtype=str)
+    return df[key_columns].fillna("").astype(str).agg("||".join, axis=1)
 
 
 def run_scrape(county, filed_start, filed_end, criminal_only=True, save_csv=True):
@@ -217,48 +302,48 @@ def run_scrape(county, filed_start, filed_end, criminal_only=True, save_csv=True
     else:
         result_df = df.copy()
 
+    master_df = result_df.copy()
+    newly_added_df = result_df.copy()
+    output_file = get_master_csv_path(county, criminal_only=criminal_only)
+
     if save_csv:
-        import os
-
-        county_slug = county.lower().replace(" ", "_")
-        suffix = "criminal" if criminal_only else "all"
-        output_file = f"ujs_{suffix}_{county_slug}.csv"
-
         dedupe_columns = [
             "DocketNumber",
             "ComplaintNumber",
             "IncidentNumber",
             "EventDate",
-            "EventType"
+            "EventType",
         ]
-        result_df = result_df.copy()
 
-        for col in dedupe_columns:
-            if col not in result_df.columns:
-                result_df[col] = ""
-            result_df[col] = result_df[col].fillna("").astype(str).str.strip()
+        result_df = prepare_dedupe_columns(result_df, dedupe_columns)
 
-        if os.path.exists(output_file):
+        if output_file.exists():
             existing_df = pd.read_csv(output_file, dtype=str, keep_default_na=False).fillna("")
-            for col in dedupe_columns:
-                if col not in existing_df.columns:
-                    existing_df[col] = ""
-                existing_df[col] = existing_df[col].fillna("").astype(str).str.strip()
+            existing_df = prepare_dedupe_columns(existing_df, dedupe_columns)
+
+            existing_keys = set(make_row_key(existing_df, dedupe_columns))
+            result_keys = make_row_key(result_df, dedupe_columns)
+            newly_added_df = result_df[~result_keys.isin(existing_keys)].copy()
+
             combined_df = pd.concat([existing_df, result_df], ignore_index=True)
             combined_df = combined_df.drop_duplicates(subset=dedupe_columns, keep="first")
         else:
             combined_df = result_df.copy()
+            newly_added_df = result_df.copy()
+
         combined_df.to_csv(output_file, index=False)
+
         docs_data_dir = Path("docs") / "data"
         docs_data_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(output_file, docs_data_dir / output_file)
-        new_rows = len(result_df)
-        total_rows = len(combined_df)
-        print(f"Processed {new_rows} scraped rows")
-        print(f"Saved deduped master file: {output_file}")
-        print(f"Master File now has {total_rows} rows")
+        shutil.copy2(output_file, docs_data_dir / output_file.name)
 
-    return result_df
+        master_df = combined_df
+        print(f"Processed {len(result_df)} scraped rows")
+        print(f"Added {len(newly_added_df)} new deduped rows to master file")
+        print(f"Saved deduped master file: {output_file}")
+        print(f"Master file now has {len(master_df)} rows")
+
+    return result_df, newly_added_df, master_df, output_file
 
 
 def default_dates():
@@ -267,16 +352,135 @@ def default_dates():
     return yesterday.strftime("%Y-%m-%d"), today.strftime("%Y-%m-%d")
 
 
+def build_baseline_email_body(inactive_complaints, master_csv_path, filed_start, filed_end):
+    count = len(inactive_complaints)
+
+    lines = [
+        "This is a test email from the Bucks UJS alert scraper.",
+        "",
+        f"Scrape date range checked: {filed_start} through {filed_end}",
+        f"Master CSV checked: {master_csv_path}",
+        f"Current inactive criminal complaint baseline count: {count}",
+        "",
+        "This baseline count comes from the deduped master CSV after today's scrape was merged in.",
+    ]
+
+    if count:
+        lines.extend([
+            "",
+            "Most recent matching rows:",
+        ])
+
+        preview_columns = [
+            "DocketNumber",
+            "CaseCaption",
+            "CaseStatus",
+            "FilingDate",
+            "EventType",
+            "EventDate",
+            "CourtOffice",
+            "DocketSheetURL",
+        ]
+        available_columns = [col for col in preview_columns if col in inactive_complaints.columns]
+        preview_df = inactive_complaints.tail(10)[available_columns]
+
+        for _, row in preview_df.iterrows():
+            lines.append("-")
+            for col in available_columns:
+                value = str(row.get(col, "")).strip()
+                if value:
+                    lines.append(f"  {col}: {value}")
+
+    return "\n".join(lines)
+
+
+def build_new_alert_email_body(new_inactive_complaints, master_csv_path, filed_start, filed_end):
+    count = len(new_inactive_complaints)
+
+    lines = [
+        "New inactive criminal complaint alert from the Bucks UJS scraper.",
+        "",
+        f"Scrape date range checked: {filed_start} through {filed_end}",
+        f"Master CSV updated: {master_csv_path}",
+        f"New inactive criminal complaints added: {count}",
+        "",
+        "Matching rows:",
+    ]
+
+    preview_columns = [
+        "DocketNumber",
+        "CaseCaption",
+        "CaseStatus",
+        "FilingDate",
+        "EventType",
+        "EventDate",
+        "CourtOffice",
+        "DocketSheetURL",
+    ]
+    available_columns = [col for col in preview_columns if col in new_inactive_complaints.columns]
+
+    for _, row in new_inactive_complaints[available_columns].iterrows():
+        lines.append("-")
+        for col in available_columns:
+            value = str(row.get(col, "")).strip()
+            if value:
+                lines.append(f"  {col}: {value}")
+
+    return "\n".join(lines)
+
+
+def handle_ujs_email_alerts(newly_added_df, master_df, master_csv_path, filed_start, filed_end):
+    recipients = load_email_recipients()
+
+    if ALERT_MODE == "baseline":
+        inactive_complaints = filter_inactive_criminal_complaints(master_df)
+        subject = f"TEST: Bucks UJS inactive criminal complaint baseline: {len(inactive_complaints)}"
+        body = build_baseline_email_body(
+            inactive_complaints=inactive_complaints,
+            master_csv_path=master_csv_path,
+            filed_start=filed_start,
+            filed_end=filed_end,
+        )
+        send_email_alert(subject, body, recipients)
+        return
+
+    if ALERT_MODE == "new_only":
+        new_inactive_complaints = filter_inactive_criminal_complaints(newly_added_df)
+        if new_inactive_complaints.empty:
+            print("No new inactive criminal complaints added. No email sent.")
+            return
+
+        subject = f"Bucks UJS alert: {len(new_inactive_complaints)} new inactive criminal complaint(s)"
+        body = build_new_alert_email_body(
+            new_inactive_complaints=new_inactive_complaints,
+            master_csv_path=master_csv_path,
+            filed_start=filed_start,
+            filed_end=filed_end,
+        )
+        send_email_alert(subject, body, recipients)
+        return
+
+    raise ValueError("ALERT_MODE must be either 'baseline' or 'new_only'")
+
+
 def main():
     filed_start, filed_end = default_dates()
-    df = run_scrape(
-        county="Bucks",
+    result_df, newly_added_df, master_df, master_csv_path = run_scrape(
+        county=COUNTY,
         filed_start=filed_start,
         filed_end=filed_end,
         criminal_only=True,
         save_csv=True,
     )
-    print(df.head())
+
+    print(result_df.head())
+    handle_ujs_email_alerts(
+        newly_added_df=newly_added_df,
+        master_df=master_df,
+        master_csv_path=master_csv_path,
+        filed_start=filed_start,
+        filed_end=filed_end,
+    )
 
 
 if __name__ == "__main__":
