@@ -27,12 +27,12 @@ SMTP_PORT = 587
 # For today, keep this on so you can get the baseline email.
 # Later, switch this to "new_only" so it emails only when a newly scraped
 # inactive criminal complaint is added to the deduped master CSV.
-ALERT_MODE = "baseline"  # options: "baseline" or "new_only"
+
 
 # This keeps the alert focused on inactive criminal complaint rows, not every
 # inactive criminal docket row. Set to False if UJS does not reliably put
 # "complaint" in EventType for the rows Jo cares about.
-REQUIRE_COMPLAINT_EVENT_TYPE = True
+#REQUIRE_COMPLAINT_EVENT_TYPE = True
 
 
 def get_session_and_token():
@@ -244,24 +244,146 @@ def filter_inactive_criminal_complaints(df):
     if df.empty:
         return df.copy()
 
-    filtered = filter_criminal(df)
+    if "DocketNumber" not in df.columns:
+        return df.iloc[0:0].copy()
 
-    if "CaseStatus" in filtered.columns:
-        filtered = filtered[
-            filtered["CaseStatus"].fillna("").astype(str).str.strip().str.casefold() == "inactive"
-        ].copy()
-    else:
-        filtered = filtered.iloc[0:0].copy()
+    searchable_text = df.fillna("").astype(str).agg(" ".join, axis=1)
 
-    if REQUIRE_COMPLAINT_EVENT_TYPE:
-        if "EventType" in filtered.columns:
-            filtered = filtered[
-                filtered["EventType"].fillna("").astype(str).str.contains("complaint", case=False, na=False)
-            ].copy()
+    is_criminal = df["DocketNumber"].fillna("").astype(str).str.contains(
+        r"-CR-",
+        case=False,
+        na=False,
+    )
+
+    is_inactive = searchable_text.str.contains(
+        r"\bInactive\b",
+        case=False,
+        na=False,
+    )
+
+    return df[is_criminal & is_inactive].copy()
+
+ALERT_LOG_FILE = "ujs_emailed_inactive_complaints_log.csv"
+
+ALERT_ID_COLUMNS = [
+    "DocketNumber",
+    "ComplaintNumber",
+    "IncidentNumber",
+    "FilingDate",
+]
+
+
+def normalize_date_for_alert(value):
+    if pd.isna(value):
+        return ""
+
+    text = str(value).strip()
+    if not text:
+        return ""
+
+    parsed = pd.to_datetime(text, errors="coerce")
+    if pd.isna(parsed):
+        return text
+
+    return parsed.strftime("%Y-%m-%d")
+
+
+def make_alert_id(row):
+    parts = []
+
+    for col in ALERT_ID_COLUMNS:
+        if col in row.index:
+            value = str(row.get(col, "")).strip()
         else:
-            filtered = filtered.iloc[0:0].copy()
+            value = ""
 
-    return filtered
+        if col == "FilingDate":
+            value = normalize_date_for_alert(value)
+
+        parts.append(value)
+
+    return "|".join(parts)
+
+
+def add_alert_ids(df):
+    df = df.copy()
+
+    if df.empty:
+        df["AlertID"] = ""
+        return df
+
+    df["AlertID"] = df.apply(make_alert_id, axis=1)
+    return df
+
+
+def load_emailed_alert_log(path=ALERT_LOG_FILE):
+    log_path = Path(path)
+
+    if not log_path.exists() or log_path.stat().st_size == 0:
+        return pd.DataFrame(columns=["AlertID", "EmailedAt"])
+
+    try:
+        log_df = pd.read_csv(log_path, dtype=str, keep_default_na=False).fillna("")
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame(columns=["AlertID", "EmailedAt"])
+
+    if "AlertID" not in log_df.columns:
+        log_df["AlertID"] = ""
+
+    if "EmailedAt" not in log_df.columns:
+        log_df["EmailedAt"] = ""
+
+    return log_df
+
+
+def append_emailed_alert_log(emailed_df, path=ALERT_LOG_FILE):
+    if emailed_df.empty:
+        return
+
+    now = dt.datetime.now().isoformat(timespec="seconds")
+
+    rows_to_log = emailed_df[["AlertID"]].copy()
+    rows_to_log["EmailedAt"] = now
+
+    existing_log = load_emailed_alert_log(path)
+
+    combined_log = pd.concat([existing_log, rows_to_log], ignore_index=True)
+    combined_log = combined_log.drop_duplicates(subset=["AlertID"], keep="first")
+
+    log_path = Path(path)
+    combined_log.to_csv(log_path, index=False)
+
+
+def filter_filing_date_today(df):
+    if df.empty:
+        return df.copy()
+
+    if "FilingDate" not in df.columns:
+        return df.iloc[0:0].copy()
+
+    today_string = dt.date.today().strftime("%Y-%m-%d")
+
+    filing_dates = df["FilingDate"].fillna("").astype(str).apply(normalize_date_for_alert)
+
+    return df[filing_dates == today_string].copy()
+
+
+def get_today_unemailed_inactive_complaints(master_df):
+    inactive_df = filter_inactive_criminal_complaints(master_df)
+    today_inactive_df = filter_filing_date_today(inactive_df)
+    today_inactive_df = add_alert_ids(today_inactive_df)
+
+    if today_inactive_df.empty:
+        return today_inactive_df
+
+    emailed_log = load_emailed_alert_log()
+    already_emailed = set(emailed_log["AlertID"].fillna("").astype(str))
+
+    unemailed_df = today_inactive_df[
+        ~today_inactive_df["AlertID"].fillna("").astype(str).isin(already_emailed)
+    ].copy()
+
+    return unemailed_df
 
 
 def get_master_csv_path(county, criminal_only=True):
@@ -402,7 +524,7 @@ def build_new_alert_email_body(new_inactive_complaints, master_csv_path, filed_s
         "",
         f"Scrape date range checked: {filed_start} through {filed_end}",
         f"Master CSV updated: {master_csv_path}",
-        f"New inactive criminal complaints added: {count}",
+        f"Inactive criminal complaints filed today and not previously emailed: {count}",
         "",
         "Matching rows:",
     ]
@@ -429,42 +551,9 @@ def build_new_alert_email_body(new_inactive_complaints, master_csv_path, filed_s
     return "\n".join(lines)
 
 
-def handle_ujs_email_alerts(newly_added_df, master_df, master_csv_path, filed_start, filed_end):
-    recipients = load_email_recipients()
-
-    if ALERT_MODE == "baseline":
-        inactive_complaints = filter_inactive_criminal_complaints(master_df)
-        subject = f"TEST: Bucks UJS inactive criminal complaint baseline: {len(inactive_complaints)}"
-        body = build_baseline_email_body(
-            inactive_complaints=inactive_complaints,
-            master_csv_path=master_csv_path,
-            filed_start=filed_start,
-            filed_end=filed_end,
-        )
-        send_email_alert(subject, body, recipients)
-        return
-
-    if ALERT_MODE == "new_only":
-        new_inactive_complaints = filter_inactive_criminal_complaints(newly_added_df)
-        if new_inactive_complaints.empty:
-            print("No new inactive criminal complaints added. No email sent.")
-            return
-
-        subject = f"Bucks UJS alert: {len(new_inactive_complaints)} new inactive criminal complaint(s)"
-        body = build_new_alert_email_body(
-            new_inactive_complaints=new_inactive_complaints,
-            master_csv_path=master_csv_path,
-            filed_start=filed_start,
-            filed_end=filed_end,
-        )
-        send_email_alert(subject, body, recipients)
-        return
-
-    raise ValueError("ALERT_MODE must be either 'baseline' or 'new_only'")
-
-
 def main():
     filed_start, filed_end = default_dates()
+
     result_df, newly_added_df, master_df, master_csv_path = run_scrape(
         county=COUNTY,
         filed_start=filed_start,
@@ -474,13 +563,29 @@ def main():
     )
 
     print(result_df.head())
-    handle_ujs_email_alerts(
-        newly_added_df=newly_added_df,
-        master_df=master_df,
+
+    alerts_df = get_today_unemailed_inactive_complaints(master_df)
+
+    if alerts_df.empty:
+        print("No new unemailed inactive criminal complaints for today.")
+        return
+
+    recipients = load_email_recipients()
+
+    subject = f"Bucks UJS alert: {len(alerts_df)} inactive criminal complaint(s) filed today"
+
+    body = build_new_alert_email_body(
+        new_inactive_complaints=alerts_df,
         master_csv_path=master_csv_path,
         filed_start=filed_start,
         filed_end=filed_end,
     )
+
+    send_email_alert(subject, body, recipients)
+
+    append_emailed_alert_log(alerts_df)
+
+    print(f"Emailed {len(alerts_df)} new inactive criminal complaint alert(s).")
 
 
 if __name__ == "__main__":

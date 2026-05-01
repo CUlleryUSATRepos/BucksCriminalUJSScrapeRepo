@@ -3,5 +3,6 @@ __pycache__/
 *.pyc
 .idea/
 scheduler_log.txt
+ujs_emailed_inactive_complaints_log.csv
 crimewatch_scraper_pwd.txt
 ujs_alert_recipients.txt
