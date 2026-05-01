@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 .idea/
 scheduler_log.txt
+crimewatch_scraper_pwd.txt
