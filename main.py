@@ -239,6 +239,25 @@ def filter_criminal(df):
         return df.iloc[0:0].copy()
     return df[df["DocketNumber"].astype(str).str.contains(r"-CR-", na=False)].copy()
 
+def filter_dashboard_event_types(df):
+    if df.empty:
+        return df.copy()
+
+    if "EventType" not in df.columns:
+        return df.copy()
+
+    excluded_event_pattern = r"\b(?:preliminary\s+hearing|formal\s+arraignment)s?\b"
+
+    event_type = df["EventType"].fillna("").astype(str)
+
+    return df[
+        ~event_type.str.contains(
+            excluded_event_pattern,
+            case=False,
+            regex=True,
+            na=False,
+        )
+    ].copy()
 
 def filter_inactive_criminal_complaints(df):
     if df.empty:
@@ -423,6 +442,7 @@ def run_scrape(county, filed_start, filed_end, criminal_only=True, save_csv=True
         result_df = filter_criminal(df)
     else:
         result_df = df.copy()
+    result_df = filter_dashboard_event_types(result_df)
 
     master_df = result_df.copy()
     newly_added_df = result_df.copy()
@@ -449,9 +469,10 @@ def run_scrape(county, filed_start, filed_end, criminal_only=True, save_csv=True
 
             combined_df = pd.concat([existing_df, result_df], ignore_index=True)
             combined_df = combined_df.drop_duplicates(subset=dedupe_columns, keep="first")
+            combined_df = filter_dashboard_event_types(combined_df)
         else:
-            combined_df = result_df.copy()
-            newly_added_df = result_df.copy()
+            combined_df = filter_dashboard_event_types(result_df.copy())
+            newly_added_df = combined_df.copy()
 
         combined_df.to_csv(output_file, index=False)
 
